@@ -1,46 +1,61 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+"""
+Password hashing (bcrypt via passlib) and JWT creation/validation.
+No hard-coded passwords or secrets — SECRET_KEY comes from the environment.
+"""
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+from dotenv import load_dotenv
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from database import get_db
 from models import User
-from schemas.schemas import UserSignup, UserLogin, Token, UserOut
-from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+load_dotenv()
+
+SECRET_KEY = os.getenv("SECRET_KEY", "insecure_dev_key_change_me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
-@router.post("/signup", response_model=Token, status_code=status.HTTP_201_CREATED)
-def signup(payload: UserSignup, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == payload.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="An account with this email already exists")
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-    user = User(
-        name=payload.name,
-        email=payload.email,
-        hashed_password=hash_password(payload.password),
-        role=payload.role if payload.role in {"admin", "customer", "driver"} else "admin",
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
 
-    token = create_access_token({"sub": user.email})
-    return Token(access_token=token, user=UserOut.model_validate(user))
-
-
-@router.post("/login", response_model=Token)
-def login(payload: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
-    if not user or not verify_password(payload.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    if payload.role and user.role != payload.role:
-        raise HTTPException(status_code=403, detail=f"This account is registered as {user.role}. Choose the {user.role.title()} login.")
-
-    token = create_access_token({"sub": user.email})
-    return Token(access_token=token, user=UserOut.model_validate(user))
-
-
-@router.get("/me", response_model=UserOut)
-def me(current_user: User = Depends(get_current_user)):
-    return current_user
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise credentials_exception
+    return user
